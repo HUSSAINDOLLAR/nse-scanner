@@ -1,0 +1,165 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import streamlit as st
+from datetime import datetime, time as dtime
+import pytz
+from streamlit_autorefresh import st_autorefresh
+
+# --- Config ---
+IST = pytz.timezone("Asia/Kolkata")
+MARKET_OPEN = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
+
+# --- Page setup ---
+st.set_page_config(page_title="NSE Intraday Scanner", layout="wide")
+st.title("📈 NSE Intraday BUY/SELL Scanner with Gap Detection")
+
+# --- Utility functions ---
+def is_market_open():
+    now_ist = datetime.now(IST).time()
+    return MARKET_OPEN <= now_ist <= MARKET_CLOSE
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / (loss.replace(0, np.nan))
+    return 100 - (100 / (1 + rs))
+
+@st.cache_data(ttl=30)
+def get_intraday(sym):
+    return yf.download(sym, period="1d", interval="1m", progress=False)
+
+@st.cache_data(ttl=300)
+def get_daily(sym):
+    return yf.download(sym, period="5d", interval="1d", progress=False)
+
+def session_vwap(df):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    pv = tp * df["Volume"]
+    return pv.cumsum() / df["Volume"].replace(0, np.nan).cumsum()
+
+def get_gap_info(sym):
+    daily = get_daily(sym)
+    if daily.shape[0] < 2:
+        return None
+    prev_close = float(daily["Close"].iloc[-2])
+    prev_high = float(daily["High"].iloc[-2])
+    prev_low = float(daily["Low"].iloc[-2])
+    intraday = get_intraday(sym)
+    if intraday.empty:
+        return None
+    today_open = float(intraday["Open"].iloc[0])
+    gap_pct = ((today_open - prev_close) / prev_close) * 100
+    near_pdh = abs(today_open - prev_high) / prev_high * 100 <= 0.2
+    near_pdl = abs(today_open - prev_low) / prev_low * 100 <= 0.2
+    return {
+        "Symbol": sym,
+        "Gap_%": round(gap_pct, 2),
+        "Near_PDH": near_pdh,
+        "Near_PDL": near_pdl
+    }
+
+def check_criteria(sym, strict, gap_up_list, gap_down_list):
+    intraday = get_intraday(sym)
+    daily = get_daily(sym)
+    if intraday.empty or daily.shape[0] < 2:
+        return None
+    pdh = float(daily["High"].iloc[-2])
+    pdl = float(daily["Low"].iloc[-2])
+    df = intraday.copy()
+    df["RSI"] = rsi(df["Close"], 14)
+    df["VWAP"] = session_vwap(df)
+    df["VolSMA"] = df["Volume"].rolling(20).mean()
+    last = df.iloc[-1]
+    close = float(last["Close"])
+    vwap = float(last["VWAP"])
+    r = float(last["RSI"])
+    vol = float(last["Volume"])
+    vol_sma = float(last["VolSMA"]) if not np.isnan(last["VolSMA"]) else vol
+    vol_ratio = vol / vol_sma if vol_sma > 0 else 1.0
+    vol_ok = vol_ratio >= (1.5 if strict else 1.0)
+
+    buy = close > vwap and close >= pdh * 0.998 and 55 <= r <= 70 and vol_ok
+    sell = close < vwap and close <= pdl * 1.002 and r <= 45 and vol_ok
+    if not (buy or sell):
+        return None
+
+    reason_parts = ["Above VWAP" if close > vwap else "Below VWAP"]
+    if buy: reason_parts.append(f"Near/Break PDH ({pdh:.2f})")
+    if sell: reason_parts.append(f"Near/Break PDL ({pdl:.2f})")
+    reason_parts.append(f"RSI {r:.1f}")
+    reason_parts.append(f"Vol {vol_ratio:.2f}× avg")
+    reason = ", ".join(reason_parts)
+
+    conf = 0
+    conf += 1 if vol_ok else 0
+    conf += 1 if (buy or sell) else 0
+    conf += min(max(abs((close - vwap) / vwap), 0), 0.01) * 100
+    conf += 0.5 if (buy and close > pdh) or (sell and close < pdl) else 0
+    conf += 0.5 if (55 <= r <= 60 or 40 <= r <= 45) else 0
+    stars_count = int(round((conf / 5) * 5))
+    stars = "★" * stars_count + "☆" * (5 - stars_count)
+
+    symbol_display = sym
+    if sym in gap_up_list: symbol_display = f"🚀 {sym}"
+    elif sym in gap_down_list: symbol_display = f"⚠️ {sym}"
+
+    return {
+        "Symbol": symbol_display,
+        "Signal": "BUY" if buy else "SELL",
+        "Reason": reason,
+        "Strength": stars,
+        "Close": round(close, 2),
+        "RSI": round(r, 1),
+        "VWAP": round(vwap, 2),
+        "Vol_Ratio": round(vol_ratio, 2),
+        "PDH": round(pdh, 2),
+        "PDL": round(pdl, 2),
+        "Confidence": round(conf, 2)
+    }
+
+# --- Universe ---
+watch_universe = [
+    "RELIANCE.NS","HDFCBANK.NS","TCS.NS","INFY.NS","ICICIBANK.NS","SBIN.NS","BHARTIARTL.NS",
+    "LT.NS","AXISBANK.NS","ITC.NS","MARUTI.NS","KOTAKBANK.NS","HINDUNILVR.NS","ASIANPAINT.NS",
+    "BAJFINANCE.NS","ADANIENT.NS","ULTRACEMCO.NS","TECHM.NS","WIPRO.NS","SUNPHARMA.NS",
+    "TATAMOTORS.NS","POWERGRID.NS","BEL.NS","DIVISLAB.NS","NTPC.NS","JSWSTEEL.NS","NESTLEIND.NS"
+]
+
+# --- Pre-market Gap Scan ---
+gap_threshold = st.slider("Gap % threshold", 0.5, 5.0, 1.0, 0.1)
+gap_list_up, gap_list_down = [], []
+if is_market_open():
+    for sym in watch_universe:
+        info = get_gap_info(sym)
+        if info and abs(info["Gap_%"]) >= gap_threshold:
+            if info["Gap_%"] > 0:
+                gap_list_up.append(sym)
+            else:
+                gap_list_down.append(sym)
+
+# --- Auto-refresh only during market hours ---
+if is_market_open():
+    st_autorefresh(interval=60000, key="nse_scanner_refresh")
+    st.caption("⏱ Auto-refresh ON — Market hours")
+else:
+    st.caption("⏸ Auto-refresh OFF — Outside market hours")
+
+# --- Live Top-5 Scanner ---
+strict_vol_scan = st.checkbox("Stricter volume filter (1.5× Vol SMA)", value=True)
+min_vol_ratio = st.slider("Min Volume/VolSMA", 1.0, 3.0, 1.5, 0.1)
+
+results = []
+for sym in watch_universe:
+    res = check_criteria(sym, strict_vol_scan, gap_list_up, gap_list_down)
+    if res and res["Vol_Ratio"] >= min_vol_ratio:
+        results.append(res)
+
+if results:
+    df_res = pd.DataFrame(results).sort_values("Confidence", ascending=False).head(5)
+    st.dataframe(df_res, use_container_width=True)
+    st.caption("🚀 Gap Up at open | ⚠️ Gap Down at open | Strength = ★☆☆☆☆ to ★★★★★")
+else:
+    st.info("No stocks meet the criteria right now.")
